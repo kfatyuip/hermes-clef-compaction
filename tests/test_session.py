@@ -58,15 +58,23 @@ def test_expected_session_mismatch_is_rejected():
         assert_single_session(msgs, expected="b")
 
 
-def test_equal_timestamps_use_stable_input_order():
+def test_equal_timestamps_canonical_order_is_permutation_invariant():
+    """D1: equal timestamps must not let input order decide canonical order.
+
+    The old contract broke ties by list position, so the same message set in
+    two different file orders produced two different canonical orders and a
+    cache hit could return the stale one. The tie-break is now the message's
+    content hash, which is invariant to input permutation.
+    """
     msgs = [
         {"role": "user", "content": "first", "timestamp": 1.0},
         {"role": "assistant", "content": "second", "timestamp": 1.0},
         {"role": "user", "content": "third", "timestamp": 1.0},
     ]
-    assert [m["content"] for m in normalize_order(msgs)] == [
-        "first", "second", "third"
-    ]
+    forward = [m["content"] for m in normalize_order(msgs)]
+    reversed_order = [m["content"] for m in normalize_order(list(reversed(msgs)))]
+    assert forward == reversed_order
+    assert sorted(forward) == ["first", "second", "third"]
 
 
 def test_batch_mode_reads_ctx_json(tmp_path, base_config):

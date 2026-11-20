@@ -86,9 +86,18 @@ def payload_tokens(
 
 
 def _split_oversized_unit(
-    unit: ConversationUnit, budget: int, summary: str
+    unit: ConversationUnit,
+    budget: int,
+    summary: str,
+    max_messages: int | None = None,
 ) -> list[list[ConversationUnit]]:
-    """Split a unit whose full payload exceeds budget into smaller sub-units."""
+    """Split a unit whose full payload exceeds budget into smaller sub-units.
+
+    ``max_messages`` mirrors ``config['chunk_size']``: the normal packing path
+    enforces a per-request message ceiling and the split path must not bypass
+    it. Optional with a ``None`` default so legacy three-argument callers stay
+    valid (D4).
+    """
     groups: list[list[ConversationUnit]] = []
     current: list[dict[str, Any]] = []
     counter = 0
@@ -105,7 +114,14 @@ def _split_oversized_unit(
 
     for msg in unit.messages:
         candidate = [ConversationUnit(unit_id=unit.unit_id, kind=unit.kind, messages=current + [msg])]
-        if current and payload_tokens(candidate, summary) > budget:
+        if current and (
+            payload_tokens(candidate, summary) > budget
+            or (
+                max_messages is not None
+                and max_messages > 0
+                and len(current) >= max_messages
+            )
+        ):
             flush()
             candidate = [ConversationUnit(unit_id=unit.unit_id, kind=unit.kind, messages=[msg])]
         current.append(msg)
@@ -158,7 +174,7 @@ def build_chunks(
                 )
                 continue
             flush_pending()
-            for subgroup in _split_oversized_unit(unit, budget, summary):
+            for subgroup in _split_oversized_unit(unit, budget, summary, max_messages):
                 chunks.append(
                     Chunk(
                         units=subgroup,

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from config import DEFAULT_HARD_PRESERVE_MARKERS
-from conversation_grouper import ConversationUnit, flatten_units, is_tool_result
+from conversation_grouper import ConversationUnit, flatten_units, is_tool_call, is_tool_result
 
 
 @dataclass
@@ -92,6 +92,19 @@ def _tool_call_ids(msg: dict[str, Any]) -> set[str]:
     return ids
 
 
+def _is_tool_unit(unit: ConversationUnit) -> bool:
+    """Detect a tool-bearing unit from message content, not from ``kind``.
+
+    In ``grouping_mode="individual"`` every unit is labelled ``solo``, so a
+    ``kind``-based check can never see a tool call/result pair (D3). Content
+    detection is mode-independent and keeps group mode unchanged.
+    """
+    return any(
+        is_tool_call(msg) or is_tool_result(msg)
+        for msg in unit.messages
+    )
+
+
 def has_hard_preserve_marker(msg: dict[str, Any], markers: tuple[str, ...]) -> bool:
     content = str(msg.get("content", ""))
     return any(marker in content for marker in markers)
@@ -155,15 +168,46 @@ def apply_retention_policy(
         if any(has_hard_preserve_marker(m, markers) for m in unit.messages):
             hard.add(unit.unit_id)
 
-    # Rule 3: tool units are atomic. If any member was retained by Clef, a
-    # fail-safe rule, or hard preservation, keep the whole unit so a tool
-    # result can never survive without its call (and vice versa).
+    # Rule 3: tool call/result pairs are atomic. Detect tool content from the
+    # messages themselves (individual mode labels every unit ``solo``), then
+    # link across units by tool_call_id: keeping a result must bring its call
+    # and vice versa. Without this, the flag is inert in individual mode and
+    # the only thing preventing orphans is the coarse retain-all fallback (D3).
     if config.get("hard_preserve_tool_links", True):
         for unit in units:
-            if "tool" in unit.kind and (
+            if _is_tool_unit(unit) and (
                 unit.unit_id in retained or unit.unit_id in hard
             ):
                 hard.add(unit.unit_id)
+
+        # Index tool ids -> units that issue a call and units that consume a
+        # result. A single id may span several units in individual mode.
+        call_units: dict[str, set[str]] = {}
+        result_units: dict[str, set[str]] = {}
+        for unit in units:
+            for msg in unit.messages:
+                for call_id in _tool_call_ids(msg):
+                    call_units.setdefault(call_id, set()).add(unit.unit_id)
+                if is_tool_result(msg) and msg.get("tool_call_id"):
+                    result_units.setdefault(str(msg["tool_call_id"]), set()).add(
+                        unit.unit_id
+                    )
+
+        # Fixpoint: adding one pair can make another pair eligible (e.g. an
+        # assistant call with two results). Bound by len(units) so it always
+        # terminates even with cyclic/duplicated ids.
+        for _ in range(len(units) + 1):
+            before = len(hard)
+            decided = retained | hard
+            for call_id, result_ids in result_units.items():
+                if result_ids & decided:
+                    hard.update(call_units.get(call_id, set()) - decided)
+            decided = retained | hard
+            for call_id, issued_by in call_units.items():
+                if issued_by & decided:
+                    hard.update(result_units.get(call_id, set()) - decided)
+            if len(hard) == before:
+                break
 
     final = retained | hard
     clef = {

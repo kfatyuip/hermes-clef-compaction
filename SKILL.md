@@ -152,6 +152,38 @@ Always run `--dry-run` and inspect the report before `--recreate`.
   retained** (fail-safe) — never silently dropped. On API failure, affected units
   are retained and the failure is recorded.
 
+### Grouping modes and the cost of atomicity
+
+- `grouping_mode=group` (default) scores each conversation unit **as a whole**,
+  so a retained answer never loses its question or tool context. The trade-off:
+  when one message in a unit is relevant, the entire unit is retained — any
+  interspersed noise inside that unit is retained with it. That noise is the
+  price of unit-level atomicity, not a scoring error; do not expect `group`
+  mode to surgically drop noisy messages that sit inside a relevant unit.
+- `hard_preserve_tool_links=true` guarantees that a tool call and its result
+  enter and leave **together** (atomicity). It does **not** guarantee that a
+  unit judged irrelevant must be retained: such a unit may still be dropped
+  as a whole, subject only to the fail-safe and structural-verification rules
+  above. Tool detection is content-based, so the guarantee also holds for the
+  single-message units produced by `individual` mode.
+- To drop interspersed noise **message by message**, set
+  `grouping_mode=individual`: each message is scored as its own unit, so an
+  irrelevant message can be discarded without taking its neighbours with it.
+  Tool call/result pairs are still linked across units when
+  `hard_preserve_tool_links=true` (content-based, fixpoint-linked).
+
+**Clef request contract.** Workers AI uses the full model id in the URL path
+and the bare model name in the JSON body. For the default model:
+
+- URL: `POST .../accounts/$CLOUDFLARE_ACCOUNT_ID/ai/run/@cf/cloudflare/clef-flash`
+- body: `{"model": "clef-flash", "state": "<summary + unit-tagged messages>", "questions": {"<unit_id>": {"type": "noul", "instructions": "..."}}}`
+
+`state` is a **plain text field** holding the summary and unit-tagged messages.
+`config["model"]` supplies the URL id; the body name is derived from it by
+`clef_model_name()`, so custom `@cf/...` ids keep the same split. Only text
+role/content is copied into `state`, which keeps SQLite BLOB/bytes columns out
+of the JSON payload.
+
 ## 7. Verification (before any destructive operation)
 
 Structural verification is **mandatory** and always runs:
@@ -222,6 +254,14 @@ mixed session IDs are rejected.
 | `hard_preserve_tool_links` | true    | Keep tool call/result units intact                                                 |
 | `api_max_retries`          | 3       | Bounded retries with exponential backoff + jitter                                  |
 
+`grouping_mode` and `hard_preserve_tool_links` are result-relevant (part of the
+cache identity) and are set in configuration, not exposed as CLI flags. See §6
+for the `group` vs `individual` trade-off and the exact guarantee of
+`hard_preserve_tool_links`. The algorithm version is currently **2.1.0** and is
+part of every cache identity; the 2.0.0 → 2.1.0 bump intentionally invalidates
+all earlier cache entries (a recomputation after upgrade is expected, not an
+error).
+
 ## 12. Troubleshooting
 
 | Symptom | Meaning / fix |
@@ -236,6 +276,9 @@ mixed session IDs are rejected.
 | `TypeError: Object of type bytes is not JSON serializable` | state.db stores some columns as SQLite BLOBs (e.g. `display_identity`). The engine strips these before API calls and output, but if you see this error the sanitization may have missed a field — check the `_sanitized_fields` sidecar on retained messages |
 | `broken_tool_dependency` with `max_messages` truncation | The default 48-message window can split a tool call from its result. Increase `--max-messages` to cover the full session, or accept the conservative retain-all fallback (all messages kept, ratio 1.0) |
 | `tool_calls` field is a JSON string, not a list | state.db stores `tool_calls` as a JSON-encoded string. The validator parses this, but custom code reading state.db directly must `json.loads()` it before iterating |
+| `ContextError: every message must be a dict` / `malformed_input` decisions | A non-dict message was supplied. As of 2.1.0 the loader rejects non-dict input with a structured error, and the filter fails safe by retaining the affected chunk (`Decision(source="malformed_input")`) instead of crashing — fix the input; do not expect a silent drop |
+| Tool call/result orphan in `individual` mode | `group` mode keeps a pair in one unit; `individual` mode makes each message its own unit, so pair preservation depends on the content-based cross-unit link gated by `hard_preserve_tool_links` (default true). If it is disabled, orphans and a retain-all fallback are possible; see §6 |
+| Cache reused after permuting equal/missing-timestamp messages | Canonical order is content-intrinsic (permutation-invariant) as of 2.1.0, so a permutation of the same message set maps to the same canonical order and may safely hit the cache; cache identity uses an order-sensitive fingerprint over that canonical order |
 
 Logs: `stderr`. Machine/human reports: cache directory under
 `~/.hermes/cache/hcompaction/v2/<sig>/`. No tokens or full message bodies are logged.

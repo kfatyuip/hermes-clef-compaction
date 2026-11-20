@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Any
 
 # Bump when filtering, grouping, retention or reconstruction semantics change.
-ALGORITHM_VERSION = "2.0.0"
+# 2.1.0: canonical order is now content-intrinsic (permutation-invariant),
+# cache identity uses an order-sensitive fingerprint, tool call/result pairs
+# are linked across individual units, split chunks honour the message ceiling,
+# and malformed (non-dict) input fails safe instead of crashing. All of these
+# change cache identity / retention semantics, so every 2.0.0 cache entry is
+# intentionally invalidated by this bump.
+ALGORITHM_VERSION = "2.1.0"
 
 DEFAULT_HARD_PRESERVE_MARKERS = ("[IMPORTANT]", "[MUST KEEP]", "[PRESERVE]", "[CRITICAL]")
 

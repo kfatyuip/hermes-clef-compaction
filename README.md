@@ -3,7 +3,7 @@
 Intelligent, **conservative and reversible** context compression for Hermes Agent
 sessions. An Agent-authored semantic summary guides Cloudflare Clef-flash relevance
 filtering; the Python engine handles deterministic grouping, caching and safe
-persistence. The goal is not maximum compression — it is the smallest *coherent*
+persistence. The goal is not maximum compression — it is the smallest _coherent_
 message set that lets Hermes keep working without losing decisions, constraints or
 conversational continuity.
 
@@ -90,25 +90,25 @@ python3 scripts/compaction_engine.py \
 
 ### Execution modes
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--analyze-only` | off | Load/group/report only. No API, no DB, no cache. |
-| `--dry-run` | off | Full pipeline incl. Clef; no DB write, no cache write. |
-| `--recreate` | **off** | Reconstruct `state.db`. Destructive; verified backup first. |
-| `--no-recreate` | — | Explicitly disable reconstruction. |
+| Flag             | Default | Effect                                                      |
+| ---------------- | ------- | ----------------------------------------------------------- |
+| `--analyze-only` | off     | Load/group/report only. No API, no DB, no cache.            |
+| `--dry-run`      | off     | Full pipeline incl. Clef; no DB write, no cache write.      |
+| `--recreate`     | **off** | Reconstruct `state.db`. Destructive; verified backup first. |
+| `--no-recreate`  | —       | Explicitly disable reconstruction.                          |
 
 ### Other options
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--threshold FLOAT` | 0.3 | Keep units with `noul >= threshold`, in `[0,1]` |
-| `--chunk-size INT` | 20 | Hard cap on messages per request |
-| `--throttle INT` | 2 | Seconds between chunks |
-| `--session-id ID` | auto | Explicit session (Agent/fallback mode) |
-| `--fallback` | off | Read `state.db`; use truncation summary if none supplied |
-| `--context-dir PATH` | `~/.hermes/cache/hcompaction` | Directory with `ctx.json` (batch mode) |
-| `--output PATH` | stdout | Write result JSON to a file |
-| `--use-external-summary` / `--no-use-external-summary` | on | Use the provided semantic summary |
+| Flag                                                   | Default                       | Meaning                                                  |
+| ------------------------------------------------------ | ----------------------------- | -------------------------------------------------------- |
+| `--threshold FLOAT`                                    | 0.3                           | Keep units with `noul >= threshold`, in `[0,1]`          |
+| `--chunk-size INT`                                     | 20                            | Hard cap on messages per request                         |
+| `--throttle INT`                                       | 2                             | Seconds between chunks                                   |
+| `--session-id ID`                                      | auto                          | Explicit session (Agent/fallback mode)                   |
+| `--fallback`                                           | off                           | Read `state.db`; use truncation summary if none supplied |
+| `--context-dir PATH`                                   | `~/.hermes/cache/hcompaction` | Directory with `ctx.json` (batch mode)                   |
+| `--output PATH`                                        | stdout                        | Write result JSON to a file                              |
+| `--use-external-summary` / `--no-use-external-summary` | on                            | Use the provided semantic summary                        |
 
 Results (JSON) are printed **once** to stdout; logs go to stderr.
 
@@ -134,6 +134,12 @@ match:
   is verified. A file lock serializes concurrent writers. Entries expire after
   `retention_days` (30).
 - Cache location: `~/.hermes/cache/hcompaction/v2/<sig-prefix>/<signature>/`.
+- The algorithm version is currently **2.1.0** and is part of every cache
+  identity. The 2.0.0 → 2.1.0 bump (content-intrinsic canonical ordering,
+  order-sensitive cache fingerprint, cross-unit tool-link preservation, a
+  `chunk_size` ceiling on split paths, and fail-safe handling of non-dict
+  input) intentionally invalidates all earlier cache entries; a recomputation
+  after upgrade is expected, not a cache failure.
 
 ## Retention & filtering
 
@@ -145,6 +151,28 @@ match:
   answer is retained and recorded. `Retained = Hard ∪ Clef ∪ FailSafe`.
 - Structural verification is mandatory; if it fails, the engine conservatively
   retains all messages.
+
+### Grouping modes: `group` vs `individual`
+
+- `group` (default) scores each conversation unit **as a whole**, so a retained
+  answer never loses its question or tool context. The cost of that atomicity:
+  when one message in a unit is relevant the whole unit is kept, and any
+  interspersed noise inside it is kept along with it — that noise is the price
+  of unit-level atomicity, not a mis-score. `group` mode does not surgically
+  drop noisy messages that sit inside a relevant unit.
+- `hard_preserve_tool_links` (default on) guarantees a tool call and its result
+  are preserved **together** (atomicity). It does **not** guarantee that a unit
+  judged irrelevant is retained: such a unit can still be dropped as a whole,
+  within the fail-safe and structural-verification rules above. Pair detection
+  is content-based, so it works in `individual` mode too.
+- To drop interspersed noise **one message at a time**, use
+  `grouping_mode=individual`, which scores each message as its own unit while
+  still linking tool call/result pairs across units when
+  `hard_preserve_tool_links` is on.
+
+`grouping_mode` and `hard_preserve_tool_links` are configuration-level options
+(result-relevant, part of the cache identity), not CLI flags — see `SKILL.md`
+§6 and §11 for details and the exact guarantees.
 
 ## Database safety & recovery
 
@@ -182,7 +210,7 @@ message bodies are logged.
 python3 -m pytest tests/ -q
 ```
 
-118 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
+132 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
 identity/integrity (all mismatch cases), filtering (all/missing/malformed/NaN/
 schema/timeout/429/partial), conversation grouping, token-safe chunking, session
 isolation/ordering, database safety (WAL, concurrency, rollback, restore, extra

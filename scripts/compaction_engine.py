@@ -27,7 +27,13 @@ from typing import Any
 from cache_manager import CACHE_MISS, CacheManager
 from chunk_manager import build_chunks
 from config import ALGORITHM_VERSION, CLEF_MODEL_ID, build_config, result_config
-from context_loader import ContextError, assert_single_session, input_fingerprint, load_messages
+from context_loader import (
+    ContextError,
+    assert_single_session,
+    input_fingerprint,
+    load_messages,
+    ordered_fingerprint,
+)
 from conversation_grouper import ConversationUnit, group_messages
 from database_manager import DatabaseManager
 from diagnostics import diagnose_messages
@@ -44,7 +50,12 @@ from summary_manager import (
     is_fallback_summary,
     load_external_summary,
 )
-from validator import RetentionOutcome, apply_retention_policy, structural_validate
+from validator import (
+    RetentionOutcome,
+    ValidationReport,
+    apply_retention_policy,
+    structural_validate,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +93,11 @@ class HermesCompaction:
     def _identity(
         self, session_id: str, messages: list[dict[str, Any]], summary: str | None
     ) -> tuple[str, dict[str, Any]]:
-        messages_hash = input_fingerprint(messages)
+        # Cache identity must be order-sensitive: two permutations that survive
+        # canonicalization with different orderings must not share an entry
+        # (D1). DB state comparison keeps the order-independent fingerprint
+        # computed separately in run() and passed to reconstruct().
+        messages_hash = ordered_fingerprint(messages)
         summary_hash = compute_summary_hash(summary)
         config_hash = compute_config_hash(result_config(self.config))
         threshold = float(self.config["compress_threshold"])
@@ -260,6 +275,11 @@ class HermesCompaction:
         session_id = str(messages[0].get("session_id") or "batch-no-session")
         self.session_id = session_id
 
+        # DB reconstruction compares against a freshly re-read row set whose
+        # retrieval order may differ, so it needs the ORDER-INDEPENDENT hash.
+        # Keep it distinct from the cache identity hash above (D1).
+        reconstruct_fingerprint = input_fingerprint(messages)
+
         # -- summary (must be resolved BEFORE cache identity) ---------------
         summary: str | None = None
         try:
@@ -336,7 +356,9 @@ class HermesCompaction:
                 ) = self._process(messages, summary)
 
             conservative_fallback = False
+            pre_fallback_validation: ValidationReport | None = None
             if not validation.ok:
+                pre_fallback_validation = validation
                 logger.warning(
                     "Structural validation failed (%d issues); using conservative "
                     "retain-all strategy",
@@ -344,6 +366,10 @@ class HermesCompaction:
                 )
                 retained_candidates = messages[:]
                 conservative_fallback = True
+                # D2: the object being validated just changed. Re-run the
+                # checks so reports/success flags describe the FINAL message
+                # set, not the failed pre-fallback candidate.
+                validation = structural_validate(messages, retained_candidates)
 
             # -- database reconstruction ------------------------------------
             db_status = "skipped"
@@ -361,7 +387,7 @@ class HermesCompaction:
                 rr = dm.reconstruct(
                     session_id,
                     retained_candidates,
-                    identity["messages_hash"],
+                    reconstruct_fingerprint,
                     source_messages=messages,
                     create_backup=True,
                 )
@@ -409,6 +435,15 @@ class HermesCompaction:
                 fallback_summary=fallback_summary,
                 dry_run=bool(self.config.get("dry_run") or analyze_only),
             )
+            # D2: keep the original failed verdict for auditing, while the
+            # primary `validation` block already describes the final set.
+            pre_fallback_report: dict[str, Any] | None = None
+            if pre_fallback_validation is not None:
+                pre_fallback_report = {
+                    "ok": pre_fallback_validation.ok,
+                    "issues": [i.__dict__ for i in pre_fallback_validation.issues],
+                }
+                report["pre_fallback_validation"] = pre_fallback_report
             if self.summary_error:
                 report["summary_error"] = self.summary_error
             if reconstruct_errors:
@@ -461,6 +496,8 @@ class HermesCompaction:
                     "backup_path": backup_path,
                     "database_errors": reconstruct_errors,
                     "validation_ok": validation.ok,
+                    "pre_fallback_validation": pre_fallback_report,
+                    "conservative_retain_all": int(conservative_fallback),
                     "input_fingerprint": identity["messages_hash"],
                     "summary_fingerprint": identity["summary_hash"],
                     "dry_run": bool(self.config.get("dry_run") or analyze_only),

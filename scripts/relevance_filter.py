@@ -302,6 +302,31 @@ class RelevanceFilter:
             self._ensure_complete(outcome.decisions, len(units))
             return list(outcome.decisions.values()), outcome
 
+        # D5: a non-dict message would raise AttributeError in question
+        # rendering and ValueError in payload building, escaping the pipeline.
+        # Detect it before touching any message, then fail safe: every unit in
+        # the affected chunk receives a verdict so completeness still holds.
+        malformed: dict[str, str] = {}
+        for unit, qid in zip(units, qids):
+            for index, msg in enumerate(getattr(unit, "messages", [])):
+                if not isinstance(msg, dict):
+                    malformed[qid] = (
+                        f"unit.messages[{index}] is not a dict "
+                        f"({type(msg).__name__})"
+                    )
+                    break
+        if malformed:
+            for qid in qids:
+                outcome.decisions[qid] = Decision(
+                    question_id=qid,
+                    retain=True,
+                    score=None,
+                    source="malformed_input",
+                    reason=malformed.get(qid, "co_retained_with_malformed_unit"),
+                )
+            self._ensure_complete(outcome.decisions, len(units))
+            return list(outcome.decisions.values()), outcome
+
         questions: dict[str, Any] = {}
         for i, (unit, qid) in enumerate(zip(units, qids)):
             text = "\n".join(

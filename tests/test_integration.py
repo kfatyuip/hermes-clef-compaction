@@ -244,3 +244,146 @@ def test_no_semantic_summary_retains_all_without_api(
     result = HermesCompaction(cfg).run()
     assert result["retained_count"] == result["original_count"]
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# D1 -- a reversed ctx.json with equal timestamps must not inherit the first
+# run's ordering from cache. Cache state must not change the output order.
+# ---------------------------------------------------------------------------
+def test_ctx_json_permuted_input_order_is_cache_deterministic(monkeypatch, tmp_path):
+    ctx_dir = tmp_path / "ctx"
+    ctx_dir.mkdir()
+    ctx_path = ctx_dir / "ctx.json"
+    messages = [
+        {"role": "user", "content": f"edge-{i:02d}", "timestamp": 1000.0}
+        for i in (0, 2, 4)
+    ]
+
+    def write(order):
+        ctx_path.write_text(json.dumps({"messages": order}), encoding="utf-8")
+
+    calls = []
+    install_fake_clef(monkeypatch, calls, scorer=lambda i, q, question: 0.9)
+    common = {
+        "context_dir": str(ctx_dir),
+        "throttle_interval": 0,
+        "cloudflare_account_id": "test-account",
+        "cloudflare_auth_token": "test-token",
+        "api_max_retries": 1,
+        "retry_base_delay": 0,
+        "hard_preserve_recent": 0,
+        "external_summary": "stable summary",
+        "chunk_size": 10,
+    }
+
+    write(messages)
+    first = HermesCompaction(build_config({**common, "cache_dir": str(tmp_path / "c1")})).run()
+    assert "error" not in first["metadata"]
+
+    # Same set, reversed file order, existing cache -> before the fix this was
+    # a hit that returned the FIRST order (stale).
+    write(list(reversed(messages)))
+    second = HermesCompaction(build_config({**common, "cache_dir": str(tmp_path / "c1")})).run()
+
+    # Same reversed input with a fresh cache -> the order it produces alone.
+    write(list(reversed(messages)))
+    third = HermesCompaction(build_config({**common, "cache_dir": str(tmp_path / "c2")})).run()
+
+    order = lambda r: [m["content"] for m in r["messages"]]
+    assert order(second) == order(third), "cache state changed the output order"
+    assert order(first) == order(third), "permutations did not canonicalize identically"
+
+
+# ---------------------------------------------------------------------------
+# D2 -- after a conservative retain-all fallback, validation/success must
+# describe the FINAL set, with the original failed verdict kept for audit.
+# ---------------------------------------------------------------------------
+def test_retain_all_fallback_recomputes_validation(monkeypatch, tmp_path, tmp_state_db):
+    seed(tmp_state_db)
+    calls = []
+    install_fake_clef(monkeypatch, calls, scorer=lambda i, q, question: 0.0)
+    cfg = make_cfg(
+        tmp_path, tmp_state_db,
+        external_summary="summary",
+        hard_preserve_recent=0,
+        dry_run=True,
+    )
+    result = HermesCompaction(cfg).run()
+    metadata = result["metadata"]
+
+    assert result["retained_count"] == result["original_count"]
+    assert metadata["conservative_retain_all"] == 1
+    # Stale False used to be reported here even though the final set is valid.
+    assert metadata["validation_ok"] is True
+    assert metadata["success"] is True
+    pre = metadata["pre_fallback_validation"]
+    assert pre is not None and pre["ok"] is False
+    assert any(i["code"] == "empty_retention" for i in pre["issues"])
+
+
+# ---------------------------------------------------------------------------
+# D3 -- individual mode: a low-scored tool call + a retained result must be
+# cross-linked when the flag is on, and must fall back when it is off.
+# ---------------------------------------------------------------------------
+def test_individual_tool_links_flag_is_observable_end_to_end(monkeypatch, tmp_path):
+    ctx_dir = tmp_path / "ctx"
+    ctx_dir.mkdir()
+    ctx_path = ctx_dir / "ctx.json"
+    messages = [
+        {"role": "user", "content": "keep-me", "timestamp": 1000.0},
+        {
+            "role": "assistant", "content": "TOOLCALL-marker",
+            "tool_calls": [{"id": "t1", "name": "f", "arguments": "{}"}],
+            "timestamp": 1001.0,
+        },
+        {
+            "role": "tool", "content": "TOOLRESULT-marker",
+            "tool_call_id": "t1", "timestamp": 1002.0,
+        },
+        {"role": "user", "content": "drop-me", "timestamp": 1003.0},
+    ]
+    ctx_path.write_text(json.dumps({"messages": messages}), encoding="utf-8")
+
+    def scorer(idx, qid, question):
+        text = question["instructions"]
+        if "TOOLCALL" in text:
+            return 0.1
+        if "TOOLRESULT" in text or "keep-me" in text:
+            return 0.9
+        return 0.1
+
+    calls = []
+    install_fake_clef(monkeypatch, calls, scorer=scorer)
+    common = {
+        "context_dir": str(ctx_dir),
+        "throttle_interval": 0,
+        "cloudflare_account_id": "test-account",
+        "cloudflare_auth_token": "test-token",
+        "api_max_retries": 1,
+        "retry_base_delay": 0,
+        "hard_preserve_recent": 0,
+        "external_summary": "summary",
+        "grouping_mode": "individual",
+        "chunk_size": 10,
+    }
+
+    linked = HermesCompaction(build_config({
+        **common, "cache_dir": str(tmp_path / "linked"),
+        "hard_preserve_tool_links": True,
+    })).run()
+    contents = [m["content"] for m in linked["messages"]]
+    assert "TOOLCALL-marker" in contents  # cross-link kept the low-scored call
+    assert "TOOLRESULT-marker" in contents
+    assert "drop-me" not in contents
+    assert linked["retained_count"] == 3
+    assert linked["metadata"]["validation_ok"] is True
+    assert linked["metadata"]["conservative_retain_all"] == 0
+
+    unlinked = HermesCompaction(build_config({
+        **common, "cache_dir": str(tmp_path / "unlinked"),
+        "hard_preserve_tool_links": False,
+    })).run()
+    # No cross-link -> orphan -> structural validation fails -> retain-all.
+    assert unlinked["retained_count"] == 4
+    assert unlinked["metadata"]["conservative_retain_all"] == 1
+    assert unlinked["metadata"]["validation_ok"] is True  # D2 recompute

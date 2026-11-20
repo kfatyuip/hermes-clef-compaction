@@ -2,8 +2,10 @@
 
 One canonical internal ordering is used everywhere: chronological,
 oldest -> newest. Messages retrieved newest-first for LIMIT efficiency are
-explicitly reversed. Ties on timestamp are broken with a stable secondary key
-(``id`` / ``rowid``) so repeated runs produce byte-identical input hashes.
+explicitly reversed. Ties on timestamp are broken with a content-intrinsic,
+permutation-invariant key (SHA-256 of the canonical message JSON) so repeated
+runs over the same message set produce byte-identical input and cache identity
+regardless of the order the messages appeared in the source file.
 """
 
 from __future__ import annotations
@@ -14,13 +16,35 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from hashing import compute_messages_hash_unordered
+from hashing import (
+    canonical_json,
+    compute_messages_hash,
+    compute_messages_hash_unordered,
+    sha256_text,
+)
 
 logger = logging.getLogger("hermes_compaction.context")
 
 
 class ContextError(ValueError):
     """Raised when the context source is ambiguous or unsafe."""
+
+
+def _require_message_dicts(messages: list[Any], source: str) -> None:
+    """Reject non-dict messages at the entry point with a structured error.
+
+    Downstream code (``normalize_order``, ``hashing``, ``RelevanceFilter``)
+    calls ``.get`` / ``sorted`` on each message. A stray string or number in
+    ``ctx.json`` would otherwise raise a bare ``AttributeError``/``TypeError``
+    that escapes the pipeline. Validate once, here, so callers always get a
+    ``ContextError`` that the engine converts into a structured error result.
+    """
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            raise ContextError(
+                f"{source} messages[{index}] must be a dict, "
+                f"got {type(msg).__name__}"
+            )
 
 
 def _columns(cursor: sqlite3.Cursor, table: str) -> list[str]:
@@ -127,6 +151,9 @@ def load_from_file(path: str | Path) -> list[dict[str, Any]]:
 
     if not isinstance(messages, list):
         raise ContextError("'messages' in context file is not a list")
+    # D5: fail with a structured ContextError instead of letting a non-dict
+    # element blow up with AttributeError inside normalize_order / hashing.
+    _require_message_dicts(messages, source=f"context file {p}")
     messages = normalize_order(messages)
     logger.info("Loaded %d messages from context file %s", len(messages), p)
     return messages
@@ -158,15 +185,24 @@ def load_messages(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalize_order(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return a chronologically ordered copy with stable tie-breaking."""
-    def key(item: tuple[int, dict[str, Any]]) -> tuple[float, int]:
-        idx, msg = item
+    """Return a chronologically ordered copy with a content-intrinsic tie-break.
+
+    Ties (missing or equal timestamps) are broken by a SHA-256 of the whole
+    message rather than by its position in the input list. The canonical order
+    is therefore invariant to input permutation: the same message set always
+    normalizes to the identical sequence, so a cache hit can never return an
+    older, differently-ordered copy of the same input (D1).
+    """
+    _require_message_dicts(messages, source="normalize_order")
+
+    def key(item: tuple[int, dict[str, Any]]) -> tuple[float, str]:
+        _, msg = item
         ts = msg.get("timestamp", 0)
         try:
             ts = float(ts)
         except (TypeError, ValueError):
             ts = 0.0
-        return (ts, idx)
+        return (ts, sha256_text(canonical_json(msg)))
 
     indexed = sorted(enumerate(messages), key=key)
     return [msg for _, msg in indexed]
@@ -199,5 +235,21 @@ def assert_single_session(
 
 
 def input_fingerprint(messages: list[dict[str, Any]]) -> str:
-    """Stable fingerprint of the exact input message set (order-independent)."""
+    """Order-independent fingerprint of the exact input message set.
+
+    Intentionally kept unordered: ``DatabaseManager.reconstruct`` compares
+    this against a freshly re-read row set whose retrieval order can differ.
+    Ordering correctness is verified separately by the structural validator.
+    """
     return compute_messages_hash_unordered(messages)
+
+
+def ordered_fingerprint(messages: list[dict[str, Any]]) -> str:
+    """Order-sensitive cache fingerprint over canonically ordered messages.
+
+    Used only for cache identity. ``normalize_order`` already removes input
+    permutation, so a repeated run over the same set hashes identically; any
+    residual ordering difference that survives canonicalization yields a new
+    signature and a recompute instead of a stale cached order (D1).
+    """
+    return compute_messages_hash(normalize_order(messages))

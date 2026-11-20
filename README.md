@@ -67,16 +67,39 @@ logic, so each responsibility is independently testable.
 
 ## Usage
 
+### Read this first: source safety
+
+`--session-id` and `--fallback` always read `state.db`, whose default is the
+**real** `~/.hermes/state.db`; `--recreate` rewrites it. For any drill, test, or
+first dry-run, use a scratch `ctx.json` directory instead and omit those flags:
+
+| Goal | Source flags | Write mode | Omit |
+|---|---|---|---|
+| Safe drill (no real DB) | `--context-dir <scratch>/ctx` (contains `ctx.json`) | `--dry-run --output <scratch>/result.json` | `--session-id`, `--fallback`, `--recreate` |
+| Real compaction | `--session-id <id>` (real `~/.hermes/state.db`) | `--dry-run` then `--recreate` | `--context-dir`, `--fallback` |
+
+See `SKILL.md` §0 for the full decision table and §5 for the machine gate to run
+before `--recreate`.
+
 ### Recommended: Agent semantic workflow
 
 1. The Agent authors a semantic summary (see `SKILL.md` §3 — five dimensions).
-2. Verify with a dry run:
+2. **Safe drill** — verify with a dry run against scratch `ctx.json`:
    ```bash
    python3 scripts/compaction_engine.py \
+     --context-dir <scratch>/ctx \
      --external-summary "<semantic summary>" \
-     --session-id <id> --dry-run
+     --dry-run --output <scratch>/result.json
    ```
-3. Inspect the report. If it is coherent, apply:
+3. Gate the result JSON: `validation_ok == true`, `conservative_retain_all == 0`,
+   `compression_ratio < 1.0`, `filter_method` contains `external semantic
+   summary`, `filter_summary.malformed_answers == 0`, `database_status ==
+   dry_run`. `SKILL.md` §5 has a copy-paste checker; a result showing `no summary
+   (conservative retain-all)` did **not** do semantic filtering — add
+   `--external-summary` and rerun.
+4. **Real apply only** — for a live session, replace `--context-dir` with
+   `--session-id <id>` and run `--recreate` (reads/writes the real
+   `~/.hermes/state.db`; a verified backup is created first):
    ```bash
    python3 scripts/compaction_engine.py \
      --external-summary "<semantic summary>" \
@@ -87,15 +110,20 @@ logic, so each responsibility is independently testable.
 
 ```bash
 python3 scripts/compaction_engine.py \
-  --external-summary-file /path/to/summary.txt --session-id <id> --recreate
+  --context-dir <scratch>/ctx \
+  --external-summary-file /path/to/summary.txt \
+  --dry-run --output <scratch>/result.json
 ```
+
+For a real apply only, swap `--context-dir ... --dry-run` for
+`--session-id <id> --recreate` (see the safety table above).
 
 ### Execution modes
 
 | Flag             | Default | Effect                                                      |
 | ---------------- | ------- | ----------------------------------------------------------- |
 | `--analyze-only` | off     | Load/group/report only. No API, no DB, no cache.            |
-| `--dry-run`      | off     | Full pipeline incl. Clef; no DB write, no cache write.      |
+| `--dry-run`      | off     | Full pipeline incl. Clef; no DB write or cache result write (report file still written under the cache dir — use `--output` for the result JSON). |
 | `--recreate`     | **off** | Reconstruct `state.db`. Destructive; verified backup first. |
 | `--no-recreate`  | —       | Explicitly disable reconstruction.                          |
 
@@ -105,6 +133,8 @@ python3 scripts/compaction_engine.py \
 | ------------------------------------------------------ | ----------------------------- | -------------------------------------------------------- |
 | `--threshold FLOAT`                                    | 0.3                           | Keep units with `noul >= threshold`, in `[0,1]`          |
 | `--chunk-size INT`                                     | 20                            | Hard cap on messages per request                         |
+| `--grouping-mode {group,individual}`                   | group                         | Score whole conversation units, or each message separately to drop interspersed noise |
+| `--cache-dir PATH`                                     | `~/.hermes/cache/hcompaction` | Cache/report dir; point at an empty dir to force a fresh run (see Caching) |
 | `--throttle INT`                                       | 2                             | Seconds between chunks                                   |
 | `--session-id ID`                                      | auto                          | Explicit session (Agent/fallback mode)                   |
 | `--fallback`                                           | off                           | Read `state.db`; use truncation summary if none supplied |
@@ -132,6 +162,9 @@ match:
 - Different summaries, thresholds, messages or configs → different cache entries.
 - Every cached entry is integrity- and identity-validated before use; corruption,
   version mismatch or missing files → cache ignored and recomputed.
+- A cache hit (`metadata.cached == true` / `cache_status: hit`) replays an earlier
+  run — **never gate on it**. Re-run the same command with `--cache-dir <empty dir>`
+  and gate the fresh result (SKILL.md §5).
 - Writes are atomic; the previous valid result is preserved until the replacement
   is verified. A file lock serializes concurrent writers. Entries expire after
   `retention_days` (30).
@@ -165,16 +198,18 @@ match:
 - `hard_preserve_tool_links` (default on) guarantees a tool call and its result
   are preserved **together** (atomicity). It does **not** guarantee that a unit
   judged irrelevant is retained: such a unit can still be dropped as a whole,
-  within the fail-safe and structural-verification rules above. Pair detection
-  is content-based, so it works in `individual` mode too.
+  within the fail-safe and structural-verification rules above. The same
+  guarantee applies in `individual` mode — a call and its result still leave
+  together.
 - To drop interspersed noise **one message at a time**, use
   `grouping_mode=individual`, which scores each message as its own unit while
   still linking tool call/result pairs across units when
   `hard_preserve_tool_links` is on.
 
-`grouping_mode` and `hard_preserve_tool_links` are configuration-level options
-(result-relevant, part of the cache identity), not CLI flags — see `SKILL.md`
-§6 and §11 for details and the exact guarantees.
+`grouping_mode` is a CLI flag (`--grouping-mode {group,individual}`);
+`hard_preserve_tool_links` has no CLI flag and is set via `build_config({...})`.
+Both are result-relevant (part of the cache identity) — see `SKILL.md` §6/§11
+for the copy-paste recipes and the exact guarantees.
 
 ## Database safety & recovery
 
@@ -195,7 +230,11 @@ reconstruction never destroys the original active messages and is reported as
 
 ## Output files
 
-- stdout (or `--output`): final result JSON
+- stdout (or `--output`): final result JSON — carries `compression_ratio` plus
+  `metadata.validation_ok`, `metadata.conservative_retain_all`,
+  `metadata.database_status`, `metadata.filter_method`,
+  `metadata.filter_summary` (incl. `malformed_answers`) and
+  `metadata.retention_breakdown`, so the `SKILL.md` §5 gate runs from this one file
 - `~/.hermes/cache/hcompaction/v2/<prefix>/<sig>/`:
   - `compacted.json` — validated cached result
   - `metadata.json` — full identity (signature, hashes, threshold, version)
@@ -212,7 +251,7 @@ message bodies are logged.
 python3 -m pytest tests/ -q
 ```
 
-132 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
+150 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
 identity/integrity (all mismatch cases), filtering (all/missing/malformed/NaN/
 schema/timeout/429/partial), conversation grouping, token-safe chunking, session
 isolation/ordering, database safety (WAL, concurrency, rollback, restore, extra

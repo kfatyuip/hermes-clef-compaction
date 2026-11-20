@@ -247,6 +247,39 @@ class HermesCompaction:
             clean["_sanitized_fields"] = dropped
         return clean
 
+    @staticmethod
+    def _gate_fields_from_report(prior_report: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild the §5 gate fields from a cached report.
+
+        A cache hit must expose the same field set as a fresh run. Older cache
+        entries predate the ``filter_summary`` key in ``build_report``, so fall
+        back to the flat fields. Without this the gate would KeyError, and
+        handing it ``.get()`` defaults instead would silently mis-judge the
+        result (SKILL.md §5).
+        """
+        summary = prior_report.get("filter_summary")
+        if not isinstance(summary, dict) or not summary:
+            summary = {
+                "api_calls": prior_report.get("api_calls", 0),
+                "failures": prior_report.get("api_failures", []),
+                "missing_answers": prior_report.get("missing_answers", 0),
+                "malformed_answers": prior_report.get("malformed_answers", 0),
+            }
+        validation = prior_report.get("validation") or {}
+        validation_ok = validation.get("ok") is True
+        database_status = prior_report.get("database_status", "skipped")
+        breakdown = prior_report.get("retention_breakdown") or {}
+        return {
+            # A cache entry is only written for a non-failed run, so success
+            # mirrors validation here; keep the db check as a safety net.
+            "success": validation_ok and database_status != "failed",
+            "validation_ok": validation_ok,
+            "database_status": database_status,
+            "conservative_retain_all": int(breakdown.get("conservative_retain_all", 0)),
+            "filter_summary": summary,
+            "retention_breakdown": breakdown,
+        }
+
     # -- main lifecycle -----------------------------------------------------
     def run(self) -> dict[str, Any]:
         started = time.time()
@@ -332,6 +365,7 @@ class HermesCompaction:
                         "summary_fingerprint": identity["summary_hash"],
                         "input_fingerprint": identity["messages_hash"],
                         "dry_run": bool(self.config.get("dry_run")),
+                        **self._gate_fields_from_report(prior_report),
                     },
                 )
 
@@ -498,6 +532,8 @@ class HermesCompaction:
                     "validation_ok": validation.ok,
                     "pre_fallback_validation": pre_fallback_report,
                     "conservative_retain_all": int(conservative_fallback),
+                    "filter_summary": filter_outcome.summary(),
+                    "retention_breakdown": breakdown,
                     "input_fingerprint": identity["messages_hash"],
                     "summary_fingerprint": identity["summary_hash"],
                     "dry_run": bool(self.config.get("dry_run") or analyze_only),
@@ -548,8 +584,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Retention threshold in [0,1] (default: 0.3).")
     parser.add_argument("--chunk-size", type=int, default=20,
                         help="Hard upper bound on messages per request (default: 20).")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Write the result JSON to this path instead of stdout.")
+    parser.add_argument(
+        "--grouping-mode",
+        choices=("group", "individual"),
+        default="group",
+        help="How messages are scored: 'group' (default) scores each conversation "
+             "unit as a whole; 'individual' scores each message separately so "
+             "interspersed noise can be dropped. Result-relevant (part of cache "
+             "identity). Tool call/result pairs stay linked in both modes when "
+             "hard_preserve_tool_links is on.",
+    )
+    parser.add_argument(
+        "--cache-dir", type=str, default=None,
+        help="Directory for cache/report files. Point at an EMPTY directory to "
+             "force a fresh run: a cache hit cannot be used for the §5 gate.",
+    )
+    parser.add_argument(
+        "--output", type=str, default=None,
+        help="Write the result JSON to this path instead of stdout.")
     parser.add_argument("--external-summary", type=str, default=None,
                         help="Raw semantic summary text supplied by the Agent.")
     parser.add_argument("--external-summary-file", type=str, default=None,
@@ -572,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
         "throttle_interval": args.throttle,
         "compress_threshold": args.threshold,
         "chunk_size": args.chunk_size,
+        "grouping_mode": args.grouping_mode,
         "output": args.output,
         "recreate": args.recreate,
         "use_external_summary": args.use_external_summary,
@@ -587,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.max_messages is not None:
         config["max_messages"] = args.max_messages
+    if args.cache_dir is not None:
+        config["cache_dir"] = args.cache_dir
 
     # --diagnose is a strictly read-only mode: load the message set and run
     # structural checks. It bypasses the compactor entirely, so no Clef call,

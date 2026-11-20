@@ -57,6 +57,9 @@ def build_report(
         "api_failures": filter_summary.get("failures", []),
         "missing_answers": filter_summary.get("missing_answers", 0),
         "malformed_answers": filter_summary.get("malformed_answers", 0),
+        # Persist the full nested summary so a later cache hit can reconstruct
+        # the §5 gate fields from this report instead of returning {}.
+        "filter_summary": filter_summary,
         "retention_breakdown": retention_breakdown,
         "cache_status": cache_status,
         "cache_reason": cache_reason,

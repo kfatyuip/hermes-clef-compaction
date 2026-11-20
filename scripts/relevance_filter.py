@@ -7,6 +7,7 @@ trust results in retention of the affected unit plus a recorded reason.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -156,6 +157,30 @@ class RelevanceFilter:
         self._call_api = call_api or self._default_call_api
         self._sleep = sleep
 
+    @staticmethod
+    def _sanitize_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """Strip non-JSON-serializable fields (BLOBs, bytes) from a message dict.
+
+        Hermes stores binary columns like ``display_identity`` as BLOBs; the
+        Clef API payload must be pure JSON. We keep all text fields and drop
+        anything that cannot be serialized, recording the drop in a sidecar
+        field so the original row is still locatable post-compaction.
+        """
+        clean: dict[str, Any] = {}
+        dropped: list[str] = []
+        for key, value in msg.items():
+            if isinstance(value, (bytes, bytearray)):
+                dropped.append(key)
+                continue
+            try:
+                json.dumps(value)
+                clean[key] = value
+            except (TypeError, ValueError):
+                dropped.append(key)
+        if dropped:
+            clean["_sanitized_fields"] = dropped
+        return clean
+
     def _default_call_api(self, payload: dict[str, Any]) -> dict[str, Any]:
         account = self.config.get("cloudflare_account_id")
         token = self.config.get("cloudflare_auth_token")
@@ -169,6 +194,16 @@ class RelevanceFilter:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        # Sanitize messages in the payload before sending: strip BLOB/bytes
+        # columns (e.g. display_identity) that SQLite returns but the API
+        # cannot serialize.
+        if "state" in payload and isinstance(payload["state"], dict):
+            msgs = payload["state"].get("messages")
+            if isinstance(msgs, list):
+                payload["state"]["messages"] = [
+                    self._sanitize_message(m) if isinstance(m, dict) else m
+                    for m in msgs
+                ]
         response = requests.post(url, json=payload, headers=headers, timeout=30)
         if response.status_code != 200:
             raise ClefAPIError(
@@ -215,6 +250,38 @@ class RelevanceFilter:
                 break
         return None, failures
 
+    @staticmethod
+    def _assign_question_ids(units: list[Any]) -> list[str]:
+        """Give every submitted unit a unique question id.
+
+        A duplicate or missing ``unit_id`` would collapse entries in the
+        ``questions``/``decisions`` dicts, leaving some units with no verdict
+        (which violates the fail-safe contract and can silently drop a unit).
+        Fall back to a positional id for any id that is absent or already used.
+        """
+        seen: set[str] = set()
+        qids: list[str] = []
+        for i, unit in enumerate(units):
+            raw = getattr(unit, "unit_id", None)
+            qid = str(raw) if raw is not None else ""
+            if not qid or qid in seen:
+                qid = f"unit_{i}"
+                suffix = 1
+                while qid in seen:
+                    qid = f"unit_{i}_{suffix}"
+                    suffix += 1
+            seen.add(qid)
+            qids.append(qid)
+        return qids
+
+    @staticmethod
+    def _ensure_complete(decisions: dict[str, Decision], expected: int) -> None:
+        if len(decisions) != expected:
+            raise AssertionError(
+                f"filter produced {len(decisions)} verdicts for {expected} units; "
+                "every submitted unit must receive a verdict"
+            )
+
     def filter_chunk(
         self,
         units: list[Any],
@@ -224,7 +291,7 @@ class RelevanceFilter:
     ) -> tuple[list[Decision], FilterOutcome]:
         """Evaluate one chunk and return one decision per unit."""
         outcome = FilterOutcome()
-        qids = [str(getattr(u, "unit_id", f"unit_{i}")) for i, u in enumerate(units)]
+        qids = self._assign_question_ids(units)
 
         if chunk_forced_retain:
             for qid in qids:
@@ -232,6 +299,7 @@ class RelevanceFilter:
                     question_id=qid, retain=True, score=None,
                     source="forced", reason=chunk_reason or "oversized_chunk",
                 )
+            self._ensure_complete(outcome.decisions, len(units))
             return list(outcome.decisions.values()), outcome
 
         questions: dict[str, Any] = {}
@@ -270,6 +338,7 @@ class RelevanceFilter:
                     question_id=qid, retain=True, score=None,
                     source="api_error", reason="; ".join(failures[-1:]) or "api_failure",
                 )
+            self._ensure_complete(outcome.decisions, len(units))
             return list(outcome.decisions.values()), outcome
 
         parsed = parse_answers(result, qids)
@@ -293,4 +362,5 @@ class RelevanceFilter:
                 )
         for decision in decisions:
             outcome.decisions[decision.question_id] = decision
+        self._ensure_complete(outcome.decisions, len(units))
         return decisions, outcome

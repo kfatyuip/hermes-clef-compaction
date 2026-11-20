@@ -30,6 +30,7 @@ from config import ALGORITHM_VERSION, CLEF_MODEL_ID, build_config, result_config
 from context_loader import ContextError, assert_single_session, input_fingerprint, load_messages
 from conversation_grouper import ConversationUnit, group_messages
 from database_manager import DatabaseManager
+from diagnostics import diagnose_messages
 from hashing import (
     compute_cache_signature,
     compute_config_hash,
@@ -191,11 +192,45 @@ class HermesCompaction:
         result_data = dict(result_data)
         result_data["metadata"] = {**metadata, **result_data.get("metadata", {})}
 
+        # Sanitize message fields before JSON serialization: strip BLOB/bytes
+        # columns (e.g. display_identity) that SQLite returns but JSON cannot
+        # represent. The original rows are untouched in state.db.
+        if "messages" in result_data and isinstance(result_data["messages"], list):
+            result_data["messages"] = [
+                self._sanitize_message(m) if isinstance(m, dict) else m
+                for m in result_data["messages"]
+            ]
+
         if self.config.get("output"):
             Path(self.config["output"]).write_text(
                 json.dumps(result_data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         return result_data
+
+    @staticmethod
+    def _sanitize_message(msg: dict[str, Any]) -> dict[str, Any]:
+        """Strip non-JSON-serializable fields (BLOBs, bytes) from a message dict.
+
+        Hermes stores binary columns like ``display_identity`` as BLOBs; the
+        Clef API payload and the output JSON must be pure JSON. We keep all
+        text fields and drop anything that cannot be serialized, recording
+        the dropped field names in ``_sanitized_fields`` so the original row
+        remains locatable in state.db post-compaction.
+        """
+        clean: dict[str, Any] = {}
+        dropped: list[str] = []
+        for key, value in msg.items():
+            if isinstance(value, (bytes, bytearray)):
+                dropped.append(key)
+                continue
+            try:
+                json.dumps(value)
+                clean[key] = value
+            except (TypeError, ValueError):
+                dropped.append(key)
+        if dropped:
+            clean["_sanitized_fields"] = dropped
+        return clean
 
     # -- main lifecycle -----------------------------------------------------
     def run(self) -> dict[str, Any]:
@@ -393,7 +428,14 @@ class HermesCompaction:
                     "compression_ratio": (
                         len(retained_candidates) / len(messages) if messages else 0.0
                     ),
-                    "messages": retained_candidates,
+                    # F1: state.db rows can carry bytes/BLOB columns (e.g.
+                    # display_identity). CacheManager.put json.dumps()es this
+                    # payload, so sanitize exactly as _result() does -- otherwise
+                    # a real BLOB raises TypeError and aborts the whole run.
+                    "messages": [
+                        self._sanitize_message(m) if isinstance(m, dict) else m
+                        for m in retained_candidates
+                    ],
                     "metadata": {"algorithm_version": ALGORITHM_VERSION},
                     "report": report,
                 }
@@ -456,6 +498,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only load, group and report. Do NOT call Clef, write the database "
              "or cache (default: false).",
     )
+    parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Read-only structural health check of the loaded message set. "
+             "Prints a JSON report; never calls Clef and never writes state.db "
+             "or the cache (default: false).",
+    )
     parser.add_argument("--throttle", type=int, default=2,
                         help="Seconds between chunks (default: 2).")
     parser.add_argument("--threshold", type=float, default=0.3,
@@ -475,6 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "truncation summary when no semantic summary is given.")
     parser.add_argument("--session-id", type=str, default=None,
                         help="Explicit session id (Agent/fallback mode).")
+    parser.add_argument("--max-messages", type=int, default=None,
+                        help="Max messages to load from session (default: 48).")
     return parser
 
 
@@ -497,6 +548,21 @@ def main(argv: list[str] | None = None) -> int:
         "dry_run": args.dry_run,
         "analyze_only": args.analyze_only,
     }
+    if args.max_messages is not None:
+        config["max_messages"] = args.max_messages
+
+    # --diagnose is a strictly read-only mode: load the message set and run
+    # structural checks. It bypasses the compactor entirely, so no Clef call,
+    # no cache/report directory creation and no state.db write can happen.
+    if args.diagnose:
+        try:
+            messages = load_messages(build_config(config))
+        except (ContextError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 2
+        print(json.dumps(diagnose_messages(messages), ensure_ascii=False, indent=2))
+        return 0
+
     try:
         compactor = HermesCompaction(config)
         result = compactor.run()

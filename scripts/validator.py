@@ -15,6 +15,8 @@ second Agent pass and never a substitute for the structural checks.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,7 +66,23 @@ def _content_key(msg: dict[str, Any]) -> tuple[Any, ...]:
 
 def _tool_call_ids(msg: dict[str, Any]) -> set[str]:
     ids: set[str] = set()
-    for call in msg.get("tool_calls") or []:
+    raw = msg.get("tool_calls")
+    if not raw:
+        return ids
+    # tool_calls may be a JSON string (as stored in Hermes state.db) or a
+    # pre-parsed list. Normalize before iterating.
+    if isinstance(raw, str):
+        try:
+            calls = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return ids
+    elif isinstance(raw, list):
+        calls = raw
+    else:
+        return ids
+    if not isinstance(calls, list):
+        return ids
+    for call in calls:
         if isinstance(call, dict):
             call_id = call.get("id") or call.get("tool_call_id")
             if call_id:
@@ -79,14 +97,45 @@ def has_hard_preserve_marker(msg: dict[str, Any], markers: tuple[str, ...]) -> b
     return any(marker in content for marker in markers)
 
 
+# chunk_manager._split_oversized_unit evaluates an oversized unit as several
+# sub-units named ``<parent>_s0``, ``<parent>_s1`` ... The relevance filter
+# returns one verdict per sub-unit id, but retention is applied against the
+# original, unsplit unit list. Child verdicts must be collapsed to their parent
+# id before policy matching or the whole unit is silently dropped.
+_CHILD_SUFFIX_RE = re.compile(r"_s\d+$")
+
+
+def _parent_unit_id(unit_id: str, known_ids: set[str]) -> str:
+    """Collapse a chunked sub-unit id (``<parent>_sN``) back to its parent id.
+
+    The candidate is collapsed only when the parent actually exists in
+    ``known_ids``; a genuine unit id that merely ends in ``_sN`` is left intact,
+    so ids without a real parent are never misattributed.
+    """
+    candidate = _CHILD_SUFFIX_RE.sub("", unit_id)
+    if candidate != unit_id and candidate in known_ids:
+        return candidate
+    return unit_id
+
+
 def apply_retention_policy(
     units: list[ConversationUnit],
     decisions: dict[str, Any],
     config: dict[str, Any],
 ) -> RetentionOutcome:
     """Combine hard-preservation rules with Clef/fail-safe decisions."""
+    known_ids = {u.unit_id for u in units}
+
+    def _norm(qid: Any) -> str:
+        # Collapse child verdict ids (``<parent>_sN``) to the parent unit id
+        # before matching, so an oversized unit split by chunk_manager is not
+        # silently dropped just because its verdicts carry sub-unit ids.
+        return _parent_unit_id(str(qid), known_ids)
+
     retained: set[str] = {
-        qid for qid, decision in decisions.items() if getattr(decision, "retain", False)
+        _norm(qid)
+        for qid, decision in decisions.items()
+        if getattr(decision, "retain", False)
     }
     hard: set[str] = set()
     markers = tuple(config.get("hard_preserve_markers", DEFAULT_HARD_PRESERVE_MARKERS))
@@ -118,11 +167,11 @@ def apply_retention_policy(
 
     final = retained | hard
     clef = {
-        qid for qid, d in decisions.items()
+        _norm(qid) for qid, d in decisions.items()
         if getattr(d, "source", "") == "clef" and getattr(d, "retain", False)
     }
     fail_safe = {
-        qid for qid, d in decisions.items()
+        _norm(qid) for qid, d in decisions.items()
         if getattr(d, "source", "") not in ("clef", "forced")
         and getattr(d, "retain", False)
     }

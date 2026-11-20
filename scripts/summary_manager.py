@@ -26,7 +26,8 @@ SUMMARY_DIMENSIONS = (
 )
 
 # Filesystem paths longer than this are rejected before any stat() call; this
-# prevents "filename too long" errors when a raw summary is passed positionally.
+# prevents "filename too long" errors on explicit ``external_summary_file``
+# values. It is never applied to raw ``external_summary`` text.
 _MAX_PATH_CANDIDATE_CHARS = 4096
 
 
@@ -64,8 +65,14 @@ def load_external_summary(config: dict[str, Any]) -> str | None:
 
     Resolution order:
       1. ``external_summary_file`` (explicit path; errors are fatal)
-      2. ``external_summary`` (raw text; a safe-looking existing file is read)
+      2. ``external_summary`` (raw text; ALWAYS treated as text, never as a
+         path -- filesystem access happens only via ``external_summary_file``)
       3. ``None`` when external summaries are disabled or nothing is set
+
+    A bare-string summary such as ``"README"`` is text even when a file with
+    that name happens to exist in the working directory. Auto-detecting paths
+    from raw text silently substituted unrelated file contents for the
+    relevance reference (finding F14) and could drop important messages.
 
     Returns ``None`` when no summary is available so the caller can decide
     between a conservative fallback and aborting (batch vs Agent mode).
@@ -88,11 +95,10 @@ def load_external_summary(config: dict[str, Any]) -> str | None:
     if not text:
         return None
 
-    path = _looks_like_readable_file(text)
-    if path is not None:
-        logger.info("Loading external summary from file: %s", path)
-        return validate_summary(_read_summary_file(path), config)
-
+    # F14 fix: raw external_summary is ALWAYS text. Never consult the
+    # filesystem here -- a bare "README"/"TODO" that happens to name an
+    # existing file must not silently replace the relevance reference.
+    # Explicit file reads go through external_summary_file above.
     return validate_summary(text, config)
 
 

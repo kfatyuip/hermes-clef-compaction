@@ -184,7 +184,7 @@ message bodies are logged.
 python3 -m pytest tests/ -q
 ```
 
-78 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
+118 tests cover summary edge cases (Unicode, paths, encoding, limits), cache
 identity/integrity (all mismatch cases), filtering (all/missing/malformed/NaN/
 schema/timeout/429/partial), conversation grouping, token-safe chunking, session
 isolation/ordering, database safety (WAL, concurrency, rollback, restore, extra

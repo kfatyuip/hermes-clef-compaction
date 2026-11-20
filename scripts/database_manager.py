@@ -112,11 +112,51 @@ class DatabaseManager:
             raise DatabaseError(f"Refusing to restore a corrupt backup: {exc}") from exc
         if not result or result[0] != "ok":
             raise DatabaseError("Refusing to restore a corrupt backup")
+
+        # D1: a WAL-mode database keeps uncheckpointed frames in <db>-wal and
+        # <db>-shm beside the main file. Replacing only the main file leaves
+        # those sidecars behind, and SQLite may replay stale frames onto the
+        # restored database -- corrupting it or resurrecting compacted rows.
+        # Checkpoint/truncate and remove them before swapping the main file.
+        self._neutralize_wal_sidecars(self.path)
+
         target = self.path.with_name(f"{self.path.name}.before_restore")
         if self.path.exists():
             self.path.replace(target)
         backup.replace(self.path)
+
+        # Re-verify the restored main file before handing control back.
+        try:
+            check = sqlite3.connect(str(self.path))
+            try:
+                restored = check.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                check.close()
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"Restored database failed integrity check: {exc}") from exc
+        if not restored or restored[0] != "ok":
+            raise DatabaseError("Restored database failed integrity check")
         logger.warning("Restored state.db from %s (previous copy: %s)", backup, target)
+
+    @staticmethod
+    def _neutralize_wal_sidecars(db_path: Path) -> None:
+        """Drop WAL/SHM sidecars so no stale frames survive a main-file swap."""
+        wal = Path(str(db_path) + "-wal")
+        shm = Path(str(db_path) + "-shm")
+        if wal.exists() or shm.exists():
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=30)
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                # Best effort: the sidecars are removed below regardless of
+                # whether a checkpoint was possible (e.g. another reader holds
+                # the DB). Stale frames must never survive the restore.
+                pass
+        wal.unlink(missing_ok=True)
+        shm.unlink(missing_ok=True)
 
     # -- snapshot -----------------------------------------------------------
     def session_fingerprint(self, session_id: str) -> str:

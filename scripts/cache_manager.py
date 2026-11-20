@@ -188,7 +188,7 @@ class CacheManager:
             if target.exists():
                 previous = target.parent / f".previous_{signature}_{uuid.uuid4().hex[:8]}"
                 os.replace(str(target), str(previous))
-                self._prune_previous(target.parent, keep=1)
+                self._prune_previous(target.parent, signature, keep=1)
             os.replace(str(tmp), str(target))
             return target
         except Exception:
@@ -221,9 +221,13 @@ class CacheManager:
         return CacheLookup(CACHE_HIT, data=data)
 
     @staticmethod
-    def _prune_previous(parent: Path, keep: int = 1) -> None:
+    def _prune_previous(parent: Path, signature: str, keep: int = 1) -> None:
+        # The parent directory is a shard shared by every signature with the
+        # same first two characters. Glob only this signature's own backups;
+        # a global glob would delete another signature's rollback copy.
         previous = sorted(
-            parent.glob(".previous_*"), key=lambda p: p.stat().st_mtime, reverse=True
+            parent.glob(f".previous_{signature}_*"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
         )
         for stale in previous[keep:]:
             shutil.rmtree(stale, ignore_errors=True)

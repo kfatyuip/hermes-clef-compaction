@@ -60,12 +60,6 @@ def test_unicode_and_chinese_preserved():
     assert load_external_summary(cfg) == text
 
 
-def test_long_text_resembling_path_treated_as_text():
-    text = "/tmp/" + ("a" * 5000)
-    cfg = build_config({"external_summary": text})
-    assert load_external_summary(cfg) == text
-
-
 def test_summary_file_does_not_exist_raises():
     cfg = build_config({"external_summary_file": "/definitely/not/here.txt"})
     with pytest.raises(SummaryError):

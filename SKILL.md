@@ -208,19 +208,19 @@ mixed session IDs are rejected.
 
 ## 11. Configuration
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `threshold` | 0.3 | Keep units with `noul >= threshold` |
-| `chunk_size` | 20 | Hard upper bound on messages per Clef request |
-| `max_messages` | 48 | Recent messages read from the session |
-| `summary_max_chars` | 8000 | Configurable summary ceiling (target 2000) |
-| `throttle_interval` | 2 | Seconds between chunks (operational only) |
-| `recreate` | false | Destructive DB write; requires explicit opt-in |
-| `use_external_summary` | true | Use the Agent-provided semantic summary |
-| `grouping_mode` | group | `group` (conversation units) or `individual` |
-| `hard_preserve_recent` | 2 | Newest N messages always retained |
-| `hard_preserve_tool_links` | true | Keep tool call/result units intact |
-| `api_max_retries` | 3 | Bounded retries with exponential backoff + jitter |
+| Parameter                  | Default | Meaning                                                                            |
+| -------------------------- | ------- | ---------------------------------------------------------------------------------- |
+| `threshold`                | 0.3     | Keep units with `noul >= threshold`                                                |
+| `chunk_size`               | 20      | Hard upper bound on messages per Clef request                                      |
+| `max_messages`             | 48      | Recent messages read from the session; overridable via `--max-messages N` CLI flag |
+| `summary_max_chars`        | 8000    | Configurable summary ceiling (target 2000)                                         |
+| `throttle_interval`        | 2       | Seconds between chunks (operational only)                                          |
+| `recreate`                 | false   | Destructive DB write; requires explicit opt-in                                     |
+| `use_external_summary`     | true    | Use the Agent-provided semantic summary                                            |
+| `grouping_mode`            | group   | `group` (conversation units) or `individual`                                       |
+| `hard_preserve_recent`     | 2       | Newest N messages always retained                                                  |
+| `hard_preserve_tool_links` | true    | Keep tool call/result units intact                                                 |
+| `api_max_retries`          | 3       | Bounded retries with exponential backoff + jitter                                  |
 
 ## 12. Troubleshooting
 
@@ -232,6 +232,10 @@ mixed session IDs are rejected.
 | `cache_status: invalid` | Cache identity/summary/version mismatch; cache was correctly ignored and recomputed |
 | Many `malformed_answers` | Clef response schema changed; affected units were retained fail-safe — inspect `retention_report.json` |
 | `RATE_LIMITED` / HTTP 429 | Increase `throttle_interval`; retries are bounded |
+| Clef API HTTP 400 "No route for that URI" or HTTP 422 "Unsupported model" | Workers AI uses two model name formats: the URL path takes the full id (`@cf/cloudflare/clef-flash`), the JSON body's `model` field takes the bare name (`clef-flash`). See the request contract in §6 and `CLEF_MODEL_ID` / `CLEF_MODEL_NAME` / `clef_model_name()` in `config.py` |
+| `TypeError: Object of type bytes is not JSON serializable` | state.db stores some columns as SQLite BLOBs (e.g. `display_identity`). The engine strips these before API calls and output, but if you see this error the sanitization may have missed a field — check the `_sanitized_fields` sidecar on retained messages |
+| `broken_tool_dependency` with `max_messages` truncation | The default 48-message window can split a tool call from its result. Increase `--max-messages` to cover the full session, or accept the conservative retain-all fallback (all messages kept, ratio 1.0) |
+| `tool_calls` field is a JSON string, not a list | state.db stores `tool_calls` as a JSON-encoded string. The validator parses this, but custom code reading state.db directly must `json.loads()` it before iterating |
 
 Logs: `stderr`. Machine/human reports: cache directory under
 `~/.hermes/cache/hcompaction/v2/<sig>/`. No tokens or full message bodies are logged.
